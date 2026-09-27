@@ -146,8 +146,6 @@ _MODEL_TYPE_TO_FAMILY: dict[str, ContinuousTokenModelFamily] = {
 _TEXT_TO_VL_FAMILY: dict[ContinuousTokenModelFamily, ContinuousTokenModelFamily] = {
     ContinuousTokenModelFamily.DEFAULT: ContinuousTokenModelFamily.VL_DEFAULT,
     ContinuousTokenModelFamily.GEMMA4: ContinuousTokenModelFamily.GEMMA4_VL,
-    # Qwen3.5 checkpoints are unified: the qwen3_5 root model_type covers both
-    # text and vision modes, and the repo ships a multimodal processor.
     ContinuousTokenModelFamily.QWEN35: ContinuousTokenModelFamily.QWEN3_VL,
 }
 
