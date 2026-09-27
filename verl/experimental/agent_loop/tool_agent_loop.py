@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -43,6 +44,40 @@ SPEC_DECODE_EXTRA_KEYS = (
     "spec_num_accepted_tokens",
     "spec_num_verify_steps",
 )
+
+# Keep this wording in sync with the serving harness: the model is trained to treat
+# this exact message as the "answer now" signal, independent of the budget size.
+# This text lands inside the decoded rollout that rewards.py scans for answer tags;
+# rewards.py imports this constant and strips exact occurrences before extraction,
+# so any wording change must keep that import working.
+#
+# The "do not call tools" clause is what makes a 2B model comply: measured on four
+# NQ questions, prompts that still offer searching as an option produce answer tags
+# 0-2 times out of 4, while this one produces them 4 out of 4.
+FORCE_ANSWER_PROMPT = (
+    "Do NOT call any more tools. Based on the information above, you MUST now "
+    "reply with only your short final answer inside <answer> and </answer>, "
+    "for example <answer>Beijing</answer>."
+)
+
+# The same signal for a run whose answers come back through a terminal tool. Asking
+# such a model for tags is a contradiction it pays for: measured on 384 NQ rollouts,
+# 14 of them answered this instruction with a finish call anyway, which the forced
+# turn then discards.
+FORCE_FINISH_PROMPT = (
+    "Do NOT search again. Based on the information above, you MUST now call the "
+    "`finish` tool with your short final answer."
+)
+
+# What a rejected search gets back once the budget is spent. This is environment state,
+# not an answer instruction: it says the tool is gone, never what to emit instead, so a
+# policy trained against it is not learning to depend on a prompt that serving withholds
+# -- any deployment enforcing the same quota returns the same thing. Ending the episode
+# here instead costs far more: 31% of thinking-enabled rollouts spend their last turn on
+# a search they are not allowed to run, and scored zero for it.
+TOOL_BUDGET_EXHAUSTED = "Search budget exhausted. No further searches are available."
+
+_ANSWER_TAG_RE = re.compile(r"<answer>.*?</answer>", re.DOTALL | re.IGNORECASE)
 
 
 class AgentState(Enum):
@@ -108,6 +143,12 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns
         self.max_assistant_turns = self.rollout_config.multi_turn.max_assistant_turns
         self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
+        self.terminal_tools = set(self.rollout_config.multi_turn.terminal_tools or [])
+        # Turning the safety net off is how the deployable number gets measured: with it
+        # on, a trajectory that never wraps up itself is rescued and scored anyway, so
+        # every reward figure is inflated by a scaffold that serving will not have.
+        self.force_final_answer = self.rollout_config.multi_turn.force_final_answer
+        self.force_answer_prompt = FORCE_FINISH_PROMPT if self.terminal_tools else FORCE_ANSWER_PROMPT
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
 
@@ -274,12 +315,15 @@ class ToolAgentLoop(AgentLoopBase):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
-        # Check termination conditions
+        # Only the limits that make further generation impossible are checked before
+        # the model's own wrap-up is considered. A trajectory that still has an
+        # assistant turn in hand is worth steering to a scorable ending rather than
+        # cutting mid-stream, because the reward reads nothing but the final answer.
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
-        if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
-            return AgentState.TERMINATED
-        if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+        # The forced final answer turn is tool-free: its tokens are already merged and
+        # scored above, so end before tool extraction.
+        if agent_data.extra_fields.get("forced_final"):
             return AgentState.TERMINATED
 
         # Extract tool calls (use per-sample tools if routed)
@@ -290,10 +334,91 @@ class ToolAgentLoop(AgentLoopBase):
         )
         agent_data.messages.append(self._build_assistant_message(assistant_content, agent_data))
 
+        # A terminal tool is the model submitting its answer, not asking for evidence,
+        # so the call itself ends the episode and is never executed. This puts the
+        # answer in the same call syntax the chat template backs with a format spec and
+        # a worked example, rather than a bare tag the model has to be talked into.
+        if self._terminal_call(agent_data.tool_calls) is not None:
+            agent_data.extra_fields["finished_by_tool"] = True
+            return AgentState.TERMINATED
+        if _ANSWER_TAG_RE.search(assistant_content or ""):
+            return AgentState.TERMINATED
+
+        # Out of assistant turns: nothing left to steer with.
+        if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            return AgentState.TERMINATED
+        # The tool budget is spent. Ending here would leave the trajectory unanswered
+        # and score it zero, which prices "used the whole search budget" below "searched
+        # once and stopped" and trains the search behaviour away. Spend the remaining
+        # assistant turn on a tool-free wrap-up instead.
+        if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            # Answer the rejected call the way a quota-limited backend would, once. A
+            # second attempt after that has had its notice and ends the episode.
+            if agent_data.tool_calls and not agent_data.extra_fields.get("budget_notified"):
+                return await self._budget_exhausted_turn(agent_data)
+            return await self._force_final_answer_turn(agent_data)
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
-        else:
+        # No tool call and no answer means the model is wrapping up in prose, which is
+        # unscorable, so spend one tool-free turn getting it restated in the required
+        # format instead of ending on an unscorable reply.
+        return await self._force_final_answer_turn(agent_data)
+
+    async def _force_final_answer_turn(self, agent_data: AgentData) -> AgentState:
+        """Append the tool-free answer instruction and hand back to generation."""
+        if not self.force_final_answer:
             return AgentState.TERMINATED
+        previous_messages = list(agent_data.messages)
+        agent_data.messages.append({"role": "user", "content": self.force_answer_prompt})
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        merge_result, response_mask, response_logprobs = await self.ct_merge_non_assistant_msg(
+            previous_messages,
+            agent_data.messages,
+            agent_data.prompt_ids,
+            agent_data.response_mask,
+            agent_data.response_logprobs if agent_data.response_logprobs else None,
+            tools=schemas,
+        )
+        if len(response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        agent_data.prompt_ids = merge_result.token_ids
+        agent_data.response_mask = response_mask
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs = response_logprobs or []
+        agent_data.extra_fields["forced_final"] = True
+        return AgentState.GENERATING
+
+    async def _budget_exhausted_turn(self, agent_data: AgentData) -> AgentState:
+        """Reject the pending tool call with a budget notice and hand back to generation.
+
+        Deliberately shaped like an ordinary tool response rather than a user turn: the
+        model already knows how to read tool output, and ``user_turns`` stays put because
+        nothing was retrieved.
+        """
+        previous_messages = list(agent_data.messages)
+        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+            message: dict[str, Any] = {"role": "tool", "content": TOOL_BUDGET_EXHAUSTED}
+            if tool_call.tool_call_id is not None:
+                message["tool_call_id"] = tool_call.tool_call_id
+            agent_data.messages.append(message)
+
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        merge_result, response_mask, response_logprobs = await self.ct_merge_non_assistant_msg(
+            previous_messages,
+            agent_data.messages,
+            agent_data.prompt_ids,
+            agent_data.response_mask,
+            agent_data.response_logprobs if agent_data.response_logprobs else None,
+            tools=schemas,
+        )
+        if len(response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        agent_data.prompt_ids = merge_result.token_ids
+        agent_data.response_mask = response_mask
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs = response_logprobs or []
+        agent_data.extra_fields["budget_notified"] = True
+        return AgentState.GENERATING
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
@@ -368,6 +493,21 @@ class ToolAgentLoop(AgentLoopBase):
         # so a failure never leaves a half-built prompt behind.
         self._assert_mm_supported(bool(new_images_this_turn))
 
+        # Force a final tool-free answer turn when the remaining token budget cannot fit
+        # another search round plus an answer. The forced_final flag makes
+        # _handle_generating_state terminate before tool extraction, so the forced turn
+        # cannot call tools.
+        #
+        # Spending the tool budget is deliberately *not* a trigger here. Attaching the
+        # answer instruction to the same merge as the tool response asks the model to
+        # digest fresh documents and emit a short answer in one turn; it answers with
+        # another tool call instead, which forced_final discards, and the trajectory
+        # ends unanswered. _handle_generating_state now gives it a clean turn instead.
+        tokens_low = len(agent_data.response_mask) > self.response_length - 768
+        if tokens_low and self.force_final_answer:
+            add_messages.append({"role": "user", "content": self.force_answer_prompt})
+            agent_data.extra_fields["forced_final"] = True
+
         agent_data.messages.extend(add_messages)
 
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
@@ -397,6 +537,19 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.user_turns += 1
         return AgentState.GENERATING
+
+    def _terminal_call(self, tool_calls: list[FunctionCall]) -> Optional[FunctionCall]:
+        """Return the first call to a terminal tool in this turn, if there is one.
+
+        Only the calls the loop would actually dispatch are considered, so a terminal
+        tool buried past ``max_parallel_calls`` does not silently end the episode.
+        """
+        if not self.terminal_tools:
+            return None
+        for tool_call in tool_calls[: self.max_parallel_calls]:
+            if tool_call.name in self.terminal_tools:
+                return tool_call
+        return None
 
     def _build_assistant_message(self, content: str, agent_data: AgentData) -> dict[str, Any]:
         message: dict[str, Any] = {"role": "assistant", "content": content or ""}

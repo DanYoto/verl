@@ -54,6 +54,8 @@ class MultiTurnConfig(BaseConfig):
     function_tool_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
+    terminal_tools: Optional[list[str]] = None
+    force_final_answer: bool = True
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"
     use_inference_chat_template: bool = False

@@ -1446,7 +1446,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
-                        entropy = verl_F.entropy_from_logits(logits)
+                        if self.engine_config.entropy_from_logits_with_chunking:
+                            # Mirror the use_remove_padding=True branch above, which has honored
+                            # this flag all along. Unchunked, entropy_from_logits holds three
+                            # (bsz, seqlen, vocab) tensors live at once -- logits, the softmax, and
+                            # the logsumexp temp -- which OOMs on large-vocab models. Chunking
+                            # walks dim 0, so flatten the (bsz, seqlen) dims and restore after.
+                            bsz, seqlen = logits.shape[:2]
+                            entropy = self.compute_entropy_from_logits(
+                                logits.reshape(-1, logits.shape[-1]),
+                                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+                            ).view(bsz, seqlen)
+                        else:
+                            entropy = verl_F.entropy_from_logits(logits)
                     else:
                         entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 

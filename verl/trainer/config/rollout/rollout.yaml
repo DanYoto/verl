@@ -201,6 +201,21 @@ multi_turn:
   # max parallel call for tools in single turn
   max_parallel_calls: 1
 
+  # Names of tools that end the episode when the model calls them, e.g. ["finish"].
+  # A terminal tool is never executed: the call itself is the model's final act, so
+  # the loop records it and stops. Use this to route the final answer through the
+  # tool channel -- the one structured format the chat template actually backs --
+  # instead of relying on the model to emit a bare tag it was never trained on.
+  # null keeps every tool executable and the episode ends on turn/token limits.
+  terminal_tools: null
+
+  # Whether the loop injects an "answer now" instruction when a trajectory is about to
+  # end without a scorable answer. True keeps the safety net; False lets such rollouts
+  # end unanswered and score zero. Turn it off to measure what the policy is worth
+  # without the scaffold -- with it on, every reward figure includes a prompt that
+  # serving will not send.
+  force_final_answer: True
+
   # max length of tool response
   max_tool_response_length: 256
 

@@ -350,7 +350,9 @@ def qwen3_5_decoder_layer_forward(
 
     hidden_states = self.input_layernorm(hidden_states)
 
-    if self.layer_type == "linear_attention":
+    # transformers renamed DecoderLayer.layer_type to block_type; support both
+    layer_type = getattr(self, "layer_type", None) or getattr(self, "block_type", None)
+    if layer_type == "linear_attention":
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cache_params=past_key_values,
@@ -358,7 +360,7 @@ def qwen3_5_decoder_layer_forward(
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
-    elif self.layer_type == "full_attention":
+    elif layer_type == "full_attention":
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
